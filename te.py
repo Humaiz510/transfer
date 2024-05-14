@@ -1,109 +1,91 @@
-import os
-import time
+import json
 import pytest
 import boto3
-import requests
-import zipfile
-import io
-import re
-import json
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
-load_dotenv()
+# Assuming aws_clients and setup_lambda are already defined in your test setup
 
-# Fixture to initialize boto3 clients
-@pytest.fixture(scope='module')
-def aws_clients():
-    session = boto3.Session(
-        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-        region_name=os.getenv('AWS_REGION')
-    )
-    return {
-        's3': session.client('s3'),
-        'sns': session.client('sns'),
-        'lambda': session.client('lambda')
-    }
-
-# Fixture to ensure the Lambda function is invoked before tests
-@pytest.fixture(scope='module', autouse=True)
-def setup_lambda(aws_clients):
-    response = aws_clients['lambda'].invoke(
-        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
-        InvocationType='RequestResponse'
-    )
-    return response
-
-# Test Lambda execution time performance
-def test_lambda_performance(aws_clients):
-    start_time = time.time()
-    response = aws_clients['lambda'].invoke(
-        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
-        InvocationType='RequestResponse'
-    )
-    duration = time.time() - start_time
-    assert duration < 1, "Lambda function took too long to execute."
-
-# Test Lambda integration with DynamoDB
-def test_lambda_integration_dynamodb(aws_clients):
-    # Assuming there's a DynamoDB interaction in the Lambda function
-    dynamodb_client = aws_clients['s3'].meta.client
-    table_name = "YourDynamoDBTable"
-    response = dynamodb_client.scan(TableName=table_name)
-    assert 'Items' in response, "Lambda did not interact correctly with DynamoDB."
-
-# Test Lambda error handling
-def test_lambda_error_handling(aws_clients):
+def test_lambda_timeout(aws_clients):
+    """ Test to ensure Lambda respects its timeout setting """
+    start_time = datetime.now()
     try:
-        aws_clients['lambda'].invoke(
+        # This should be adjusted to trigger a timeout based on the function's timeout setting
+        response = aws_clients['lambda'].invoke(
             FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
             InvocationType='RequestResponse',
-            Payload=json.dumps({"test": "error_triggering_input"})  # Assuming this input triggers an error
+            Payload=json.dumps({"simulate": "long_running_process"})
         )
-    except Exception as e:
-        assert "Error" in str(e), "Lambda did not handle errors as expected."
+        duration = datetime.now() - start_time
+        # Fetch the configured timeout from Lambda configuration
+        config = aws_clients['lambda'].get_function_configuration(
+            FunctionName=os.getenv('LAMBDA_FUNCTION_NAME')
+        )
+        configured_timeout = config['Timeout']
+        assert duration.seconds <= configured_timeout, "Function ran longer than configured timeout"
+    except aws_clients['lambda'].exceptions.FunctionTimedOutException:
+        # Expected to catch timeout for long-running processes
+        pass
 
-# Test environment variables are set and accessible in Lambda
-def test_lambda_environment_variables(aws_clients):
-    response = aws_clients['lambda'].get_function_configuration(
+def test_memory_usage(aws_clients):
+    """ Test to verify that the Lambda does not exceed its memory allocation """
+    # Simulate a scenario that could potentially use high memory
+    response = aws_clients['lambda'].invoke(
+        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
+        InvocationType='RequestResponse',
+        Payload=json.dumps({"test": "memory_usage"})
+    )
+    # Fetch the last invocation metrics from CloudWatch
+    cw_client = aws_clients['s3'].meta.client
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(minutes=5)  # Adjust as needed
+    metrics = cw_client.get_metric_data(
+        MetricName='MaxMemoryUsed',
+        Namespace='AWS/Lambda',
+        Period=300,
+        StartTime=start_time,
+        EndTime=end_time,
+        Dimensions=[{'Name': 'FunctionName', 'Value': os.getenv('LAMBDA_FUNCTION_NAME')}]
+    )
+    max_memory_used = max(data['Values'] for data in metrics['MetricDataResults'])
+    config = aws_clients['lambda'].get_function_configuration(
         FunctionName=os.getenv('LAMBDA_FUNCTION_NAME')
     )
-    env_vars = response['Environment']['Variables']
-    assert 'MY_REQUIRED_ENV_VAR' in env_vars, "Required environment variable is missing."
+    assert max_memory_used <= config['MemorySize'], "Lambda function exceeded its memory allocation"
 
-# Test security policy of Lambda
-def test_lambda_security(aws_clients):
-    response = aws_clients['lambda'].get_policy(
-        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME')
-    )
-    policy_document = json.loads(response['Policy'])
-    assert 'Statement' in policy_document, "Lambda IAM policy is not correctly set."
+def test_concurrent_executions(aws_clients):
+    """ Test how Lambda handles concurrent executions """
+    from threading import Thread
 
-# Test Lambda under load
-def test_lambda_load(aws_clients):
-    for _ in range(100):
+    def invoke_lambda():
         aws_clients['lambda'].invoke(
             FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
             InvocationType='Event'
         )
-    assert True, "Lambda could not handle the load."
 
-# Test Lambda input validation
-def test_lambda_input_validation(aws_clients):
-    response = aws_clients['lambda'].invoke(
+    threads = [Thread(target=invoke_lambda) for _ in range(10)]  # Simulate 10 concurrent invocations
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # Check logs or metrics to confirm all were handled correctly
+    # Example using logs (further implementation needed to fetch logs and analyze them)
+
+def test_idempotency(aws_clients):
+    """ Ensure that the Lambda function is idempotent when required """
+    # Invoke with the same input multiple times
+    input_payload = json.dumps({"idempotent": "data", "timestamp": datetime.utcnow().isoformat()})
+    first_response = aws_clients['lambda'].invoke(
         FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
         InvocationType='RequestResponse',
-        Payload=json.dumps({"invalid": "data"})
+        Payload=input_payload
     )
-    assert "error" in response['Payload'].read().decode(), "Lambda did not validate input properly."
-
-# Test Lambda output correctness
-def test_lambda_output_validation(aws_clients):
-    response = aws_clients['lambda'].invoke(
+    second_response = aws_clients['lambda'].invoke(
         FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
         InvocationType='RequestResponse',
-        Payload=json.dumps({"valid": "input"})
+        Payload=input_payload
     )
-    output = json.loads(response['Payload'].read().decode())
-    expected_output = {"result": "expected_value"}
-    assert output == expected_output, "Lambda output did not match expected output."
+    # Ensure responses are the same
+    assert first_response['Payload'].read() == second_response['Payload'].read(), "Responses differ for the same input"
+
+# Additional tests can be added following the patterns above

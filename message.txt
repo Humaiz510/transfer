@@ -1,0 +1,17 @@
+Hello Team,
+
+We encountered a test failure in our Lambda regression suite. Here are the details:
+
+- **Test Name:** [Test Name]
+- **Lambda Function:** [Lambda Function Name]
+- **Environment:** [Environment Info]
+- **Failure Time:** [Timestamp]
+- **Error Message:** [Error Description]
+
+**Additional Details:**
+[Error Trace or Additional Information]
+
+Please investigate this issue to understand the root cause and take corrective action. Reach out to the development or operations team if further analysis is required.
+
+Best regards,
+[Your Team Name or Automated System Name]

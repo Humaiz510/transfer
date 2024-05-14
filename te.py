@@ -11,7 +11,10 @@ def aws_clients():
         'cloudwatch': boto3.client('cloudwatch'),
         's3': boto3.client('s3'),
         'logs': boto3.client('logs'),
-        'iam': boto3.client('iam')
+        'dynamodb': boto3.client('dynamodb'),
+        'iam': boto3.client('iam'),
+        'sns': boto3.client('sns'),
+        'sqs': boto3.client('sqs')
     }
 
 def test_api_contract(aws_clients):
@@ -79,11 +82,10 @@ def test_resource_cleanup(aws_clients):
 
 def test_integration_with_dynamodb(aws_clients):
     """Test Lambda integration with DynamoDB."""
-    dynamodb_client = boto3.client('dynamodb')
     test_table = os.getenv('TEST_DYNAMODB_TABLE')
     
     # Put an item in the DynamoDB table
-    dynamodb_client.put_item(
+    aws_clients['dynamodb'].put_item(
         TableName=test_table,
         Item={'id': {'S': 'test-id'}, 'value': {'S': 'test-value'}}
     )
@@ -111,7 +113,6 @@ def test_environment_variables(aws_clients):
 
 def test_iam_roles_and_permissions(aws_clients):
     """Ensure Lambda has correct IAM roles and permissions."""
-    iam_client = aws_clients['iam']
     function_name = os.getenv('LAMBDA_FUNCTION_NAME')
     
     response = aws_clients['lambda'].get_function(
@@ -120,7 +121,7 @@ def test_iam_roles_and_permissions(aws_clients):
     role_arn = response['Configuration']['Role']
     
     role_name = role_arn.split('/')[-1]
-    policy_response = iam_client.list_attached_role_policies(
+    policy_response = aws_clients['iam'].list_attached_role_policies(
         RoleName=role_name
     )
     
@@ -129,4 +130,110 @@ def test_iam_roles_and_permissions(aws_clients):
     
     assert expected_policy_arn in attached_policies, f"Expected policy {expected_policy_arn} not attached to the role"
 
-# Additional comprehensive tests can be added following these patterns
+def test_logging(aws_clients):
+    """Verify that Lambda logs events correctly."""
+    log_group_name = f"/aws/lambda/{os.getenv('LAMBDA_FUNCTION_NAME')}"
+    response = aws_clients['lambda'].invoke(
+        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
+        InvocationType='RequestResponse',
+        Payload=json.dumps({"action": "generate_log"})
+    )
+    
+    log_events = aws_clients['logs'].filter_log_events(
+        logGroupName=log_group_name,
+        startTime=int((datetime.utcnow() - timedelta(minutes=1)).timestamp() * 1000)
+    )
+    
+    assert any("Log message" in event['message'] for event in log_events['events']), "Expected log message not found"
+
+def test_response_time(aws_clients):
+    """Ensure the response time is within acceptable limits."""
+    start_time = datetime.utcnow()
+    response = aws_clients['lambda'].invoke(
+        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
+        InvocationType='RequestResponse',
+        Payload=json.dumps({"action": "test_response_time"})
+    )
+    end_time = datetime.utcnow()
+    
+    duration = (end_time - start_time).total_seconds()
+    assert duration < 1, "Response time exceeded 1 second"
+
+def test_sns_integration(aws_clients):
+    """Test Lambda integration with SNS."""
+    sns_topic_arn = os.getenv('SNS_TOPIC_ARN')
+    
+    response = aws_clients['lambda'].invoke(
+        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
+        InvocationType='RequestResponse',
+        Payload=json.dumps({"action": "sns_publish", "message": "Test message", "topic_arn": sns_topic_arn})
+    )
+    
+    response_payload = json.loads(response['Payload'].read())
+    assert response_payload['status'] == 'success', "SNS integration failed"
+
+def test_sqs_integration(aws_clients):
+    """Test Lambda integration with SQS."""
+    sqs_queue_url = os.getenv('SQS_QUEUE_URL')
+    
+    response = aws_clients['lambda'].invoke(
+        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
+        InvocationType='RequestResponse',
+        Payload=json.dumps({"action": "sqs_send_message", "message": "Test message", "queue_url": sqs_queue_url})
+    )
+    
+    response_payload = json.loads(response['Payload'].read())
+    assert response_payload['status'] == 'success', "SQS integration failed"
+
+def test_lambda_timeout(aws_clients):
+    """Test Lambda respects its timeout setting."""
+    start_time = datetime.now()
+    try:
+        aws_clients['lambda'].invoke(
+            FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
+            InvocationType='RequestResponse',
+            Payload=json.dumps({"simulate": "long_running_process"})
+        )
+        duration = datetime.now() - start_time
+        config = aws_clients['lambda'].get_function_configuration(
+            FunctionName=os.getenv('LAMBDA_FUNCTION_NAME')
+        )
+        configured_timeout = config['Timeout']
+        assert duration.seconds <= configured_timeout, "Function ran longer than configured timeout"
+    except aws_clients['lambda'].exceptions.FunctionTimedOutException:
+        pass
+
+def test_memory_usage(aws_clients):
+    """Test Lambda does not exceed its memory allocation."""
+    aws_clients['lambda'].invoke(
+        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
+        InvocationType='RequestResponse',
+        Payload=json.dumps({"test": "memory_usage"})
+    )
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(minutes=5)
+    metrics = aws_clients['cloudwatch'].get_metric_data(
+        MetricDataQueries=[
+            {
+                'Id': 'maxMemoryUsed',
+                'MetricStat': {
+                    'Metric': {
+                        'Namespace': 'AWS/Lambda',
+                        'MetricName': 'MaxMemoryUsed',
+                        'Dimensions': [{'Name': 'FunctionName', 'Value': os.getenv('LAMBDA_FUNCTION_NAME')}]
+                    },
+                    'Period': 60,
+                    'Stat': 'Maximum'
+                }
+            }
+        ],
+        StartTime=start_time,
+        EndTime=end_time
+    )
+    max_memory_used = max(metrics['MetricDataResults'][0]['Values'])
+    config = aws_clients['lambda'].get_function_configuration(
+        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME')
+    )
+    assert max_memory_used <= config['MemorySize'], "Lambda function exceeded its memory allocation"
+
+def

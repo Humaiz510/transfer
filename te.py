@@ -1,59 +1,70 @@
 import json
+import os
 import pytest
 import boto3
 from datetime import datetime, timedelta
 
-# Assuming aws_clients and setup_lambda are already defined in your test setup
+@pytest.fixture
+def aws_clients():
+    return {
+        'lambda': boto3.client('lambda'),
+        'cloudwatch': boto3.client('cloudwatch'),
+        's3': boto3.client('s3')
+    }
 
 def test_lambda_timeout(aws_clients):
-    """ Test to ensure Lambda respects its timeout setting """
+    """Test to ensure Lambda respects its timeout setting."""
     start_time = datetime.now()
     try:
-        # This should be adjusted to trigger a timeout based on the function's timeout setting
         response = aws_clients['lambda'].invoke(
             FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
             InvocationType='RequestResponse',
             Payload=json.dumps({"simulate": "long_running_process"})
         )
         duration = datetime.now() - start_time
-        # Fetch the configured timeout from Lambda configuration
         config = aws_clients['lambda'].get_function_configuration(
             FunctionName=os.getenv('LAMBDA_FUNCTION_NAME')
         )
         configured_timeout = config['Timeout']
         assert duration.seconds <= configured_timeout, "Function ran longer than configured timeout"
     except aws_clients['lambda'].exceptions.FunctionTimedOutException:
-        # Expected to catch timeout for long-running processes
         pass
 
 def test_memory_usage(aws_clients):
-    """ Test to verify that the Lambda does not exceed its memory allocation """
-    # Simulate a scenario that could potentially use high memory
+    """Test to verify that the Lambda does not exceed its memory allocation."""
     response = aws_clients['lambda'].invoke(
         FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
         InvocationType='RequestResponse',
         Payload=json.dumps({"test": "memory_usage"})
     )
-    # Fetch the last invocation metrics from CloudWatch
-    cw_client = aws_clients['s3'].meta.client
     end_time = datetime.utcnow()
-    start_time = end_time - timedelta(minutes=5)  # Adjust as needed
-    metrics = cw_client.get_metric_data(
-        MetricName='MaxMemoryUsed',
-        Namespace='AWS/Lambda',
-        Period=300,
+    start_time = end_time - timedelta(minutes=5)
+    metrics = aws_clients['cloudwatch'].get_metric_data(
+        MetricDataQueries=[
+            {
+                'Id': 'maxMemoryUsed',
+                'MetricStat': {
+                    'Metric': {
+                        'Namespace': 'AWS/Lambda',
+                        'MetricName': 'MaxMemoryUsed',
+                        'Dimensions': [{'Name': 'FunctionName', 'Value': os.getenv('LAMBDA_FUNCTION_NAME')}]
+                    },
+                    'Period': 60,
+                    'Stat': 'Maximum'
+                }
+            }
+        ],
         StartTime=start_time,
-        EndTime=end_time,
-        Dimensions=[{'Name': 'FunctionName', 'Value': os.getenv('LAMBDA_FUNCTION_NAME')}]
+        EndTime=end_time
     )
-    max_memory_used = max(data['Values'] for data in metrics['MetricDataResults'])
+    max_memory_used = max(metrics['MetricDataResults'][0]['Values'])
     config = aws_clients['lambda'].get_function_configuration(
         FunctionName=os.getenv('LAMBDA_FUNCTION_NAME')
     )
     assert max_memory_used <= config['MemorySize'], "Lambda function exceeded its memory allocation"
 
 def test_concurrent_executions(aws_clients):
-    """ Test how Lambda handles concurrent executions """
+    """Test how Lambda handles concurrent executions."""
     from threading import Thread
 
     def invoke_lambda():
@@ -62,18 +73,17 @@ def test_concurrent_executions(aws_clients):
             InvocationType='Event'
         )
 
-    threads = [Thread(target=invoke_lambda) for _ in range(10)]  # Simulate 10 concurrent invocations
+    threads = [Thread(target=invoke_lambda) for _ in range(10)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
 
-    # Check logs or metrics to confirm all were handled correctly
-    # Example using logs (further implementation needed to fetch logs and analyze them)
+    # Additional checks can be added here to verify concurrency handling
+    # This might include log inspection or metrics analysis
 
 def test_idempotency(aws_clients):
-    """ Ensure that the Lambda function is idempotent when required """
-    # Invoke with the same input multiple times
+    """Ensure that the Lambda function is idempotent when required."""
     input_payload = json.dumps({"idempotent": "data", "timestamp": datetime.utcnow().isoformat()})
     first_response = aws_clients['lambda'].invoke(
         FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
@@ -85,7 +95,50 @@ def test_idempotency(aws_clients):
         InvocationType='RequestResponse',
         Payload=input_payload
     )
-    # Ensure responses are the same
     assert first_response['Payload'].read() == second_response['Payload'].read(), "Responses differ for the same input"
 
-# Additional tests can be added following the patterns above
+def test_cold_start_performance(aws_clients):
+    """Test Lambda cold start performance."""
+    response = aws_clients['lambda'].invoke(
+        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
+        InvocationType='RequestResponse',
+        Payload=json.dumps({"test": "cold_start"})
+    )
+    assert response['StatusCode'] == 200, "Cold start invocation failed"
+    cold_start_duration = response['ResponseMetadata']['HTTPHeaders']['x-amzn-RequestId']
+    assert cold_start_duration < os.getenv('COLD_START_THRESHOLD'), "Cold start duration exceeded threshold"
+
+def test_integration_with_s3(aws_clients):
+    """Test Lambda integration with S3."""
+    s3_client = aws_clients['s3']
+    test_bucket = os.getenv('TEST_S3_BUCKET')
+    test_key = 'test-key'
+
+    # Upload a test file to S3
+    s3_client.put_object(Bucket=test_bucket, Key=test_key, Body="Test content")
+    
+    # Invoke Lambda to process the test file
+    response = aws_clients['lambda'].invoke(
+        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
+        InvocationType='RequestResponse',
+        Payload=json.dumps({"bucket": test_bucket, "key": test_key})
+    )
+    
+    # Verify Lambda processed the file as expected
+    processed_key = 'processed/test-key'
+    processed_object = s3_client.get_object(Bucket=test_bucket, Key=processed_key)
+    assert processed_object['Body'].read() == b"Processed content", "S3 integration failed"
+
+def test_response_structure(aws_clients):
+    """Test that the Lambda function returns a response with the correct structure."""
+    response = aws_clients['lambda'].invoke(
+        FunctionName=os.getenv('LAMBDA_FUNCTION_NAME'),
+        InvocationType='RequestResponse',
+        Payload=json.dumps({"test": "response_structure"})
+    )
+    response_payload = json.loads(response['Payload'].read())
+    assert 'statusCode' in response_payload, "Response missing statusCode"
+    assert 'body' in response_payload, "Response missing body"
+    body = json.loads(response_payload['body'])
+    assert 'message' in body, "Response body missing message"
+    assert 'data' in body, "Response body missing data"

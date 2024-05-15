@@ -6,8 +6,10 @@ from botocore.exceptions import ClientError
 
 AWS_REGION = 'us-east-1'  # Change as needed
 LAMBDA_FUNCTION_NAME = 'your_lambda_function_name'  # Change as needed
+SNS_TOPIC_ARN = 'arn:aws:sns:your-region:your-account-id:your-topic'  # Change as needed
 
 client = boto3.client('lambda', region_name=AWS_REGION)
+sns_client = boto3.client('sns', region_name=AWS_REGION)
 
 @pytest.fixture(scope='module')
 def lambda_client():
@@ -59,6 +61,33 @@ def resource_exists(lambda_client, resource_type):
     if resource_type == 'dynamodb':
         return True  # Assume true if Lambda has permission to interact with DynamoDB
     return False
+
+def send_sns_message(test_name, error_message, additional_details):
+    try:
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Message=json.dumps({
+                'default': json.dumps({
+                    'test_name': test_name,
+                    'error_message': error_message,
+                    'additional_details': additional_details
+                })
+            }),
+            MessageStructure='json'
+        )
+    except ClientError as e:
+        print(f"Failed to send SNS message: {e}")
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+
+    if report.failed:
+        test_name = report.nodeid
+        error_message = report.longreprtext
+        additional_details = "Additional details can go here."
+        send_sns_message(test_name, error_message, additional_details)
 
 # 1. Test basic invocation
 def test_basic_invocation(lambda_client):
@@ -166,4 +195,34 @@ def test_function_throttling(lambda_client):
             return
     pytest.fail("Function did not throttle")
 
-# 16. Test function dead-letter queue (DLQ)
+# 16. Test function dead-letter queue (DLQ) configuration
+@pytest.mark.skipif(not resource_exists(client, 'dead_letter_config'), reason="No DLQ configured")
+def test_dlq_configuration(lambda_client):
+    config = get_function_configuration(lambda_client)
+    dlq = config.get('DeadLetterConfig', {}).get('TargetArn')
+    assert dlq is not None
+
+# 17. Test function log group exists
+def test_log_group_exists(lambda_client):
+    log_client = boto3.client('logs', region_name=AWS_REGION)
+    log_group_name = f"/aws/lambda/{LAMBDA_FUNCTION_NAME}"
+    try:
+        response = log_client.describe_log_groups(
+            logGroupNamePrefix=log_group_name
+        )
+        assert any(lg['logGroupName'] == log_group_name for lg in response['logGroups'])
+    except ClientError as e:
+        pytest.fail(f"Unexpected error: {e}")
+
+# 18. Test function alias existence
+def test_function_alias(lambda_client):
+    try:
+        response = lambda_client.get_alias(
+            FunctionName=LAMBDA_FUNCTION_NAME,
+            Name='alias-name'  # Change as needed
+        )
+        assert response['Name'] == 'alias-name'
+    except ClientError as e:
+        pytest.fail(f"Unexpected error: {e}")
+
+# 19.

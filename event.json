@@ -1,0 +1,7 @@
+{
+  "source": ["aws.lambda"],
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "detail": {
+    "eventName": ["UpdateFunctionCode", "UpdateFunctionConfiguration"]
+  }
+}

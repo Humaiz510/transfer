@@ -176,6 +176,95 @@ class TestEC2RegressionSuite:
         state_reason = response['Reservations'][0]['Instances'][0].get('StateReason', {}).get('Message', '')
         assert state_reason == '', f"Instance is not accessible: {state_reason}"
 
+    def test_no_critical_high_severity_findings(self):
+        start_of_day, end_of_day = self.get_today_date_range()
+        findings = self.inspector_client.list_findings(
+            filterCriteria={
+                'resourceId': [{'comparison': 'EQUALS', 'value': self.instance_id}],
+                'severity': [{'comparison': 'EQUALS', 'value': 'HIGH'}, {'comparison': 'EQUALS', 'value': 'CRITICAL'}],
+                'createdAt': [{'startInclusive': start_of_day, 'endExclusive': end_of_day}]
+            }
+        )['findings']
+        
+        assert len(findings) == 0, f"Critical or high severity findings found: {findings}"
+
+    def test_no_unresolved_findings(self):
+        start_of_day, end_of_day = self.get_today_date_range()
+        findings = self.inspector_client.list_findings(
+            filterCriteria={
+                'resourceId': [{'comparison': 'EQUALS', 'value': self.instance_id}],
+                'status': [{'comparison': 'EQUALS', 'value': 'UNRESOLVED'}],
+                'createdAt': [{'startInclusive': start_of_day, 'endExclusive': end_of_day}]
+            }
+        )['findings']
+        
+        assert len(findings) == 0, f"Unresolved findings found: {findings}"
+
+    def test_no_exceeded_sla_findings(self):
+        start_of_day, end_of_day = self.get_today_date_range()
+        findings = self.inspector_client.list_findings(
+            filterCriteria={
+                'resourceId': [{'comparison': 'EQUALS', 'value': self.instance_id}],
+                'remediation': [{'comparison': 'EXCEEDED_SLA'}],
+                'createdAt': [{'startInclusive': start_of_day, 'endExclusive': end_of_day}]
+            }
+        )['findings']
+        
+        assert len(findings) == 0, f"Findings with exceeded SLA found: {findings}"
+
+    def test_specific_vulnerabilities_absent(self, vulnerability_ids):
+        start_of_day, end_of_day = self.get_today_date_range()
+        for vuln in vulnerability_ids:
+            findings = self.inspector_client.list_findings(
+                filterCriteria={
+                    'resourceId': [{'comparison': 'EQUALS', 'value': self.instance_id}],
+                    'vulnerabilityId': [{'comparison': 'EQUALS', 'value': vuln}],
+                    'createdAt': [{'startInclusive': start_of_day, 'endExclusive': end_of_day}]
+                }
+            )['findings']
+            assert len(findings) == 0, f"Vulnerability {vuln} found in EC2 instance: {findings}"
+
+    def test_inspector_rules_compliance(self):
+        start_of_day, end_of_day = self.get_today_date_range()
+        findings = self.inspector_client.list_findings(
+            filterCriteria={
+                'resourceId': [{'comparison': 'EQUALS', 'value': self.instance_id}],
+                'createdAt': [{'startInclusive': start_of_day, 'endExclusive': end_of_day}]
+            }
+        )['findings']
+        
+        rule_arns = set(finding['inspectorRuleArn'] for finding in findings)
+        
+        for rule_arn in rule_arns:
+            rule_findings = [finding for finding in findings if finding['inspectorRuleArn'] == rule_arn]
+            assert len(rule_findings) == 0, f"Non-compliance with rule {rule_arn} found: {rule_findings}"
+
+    def test_inspector_finding_count_below_threshold(self):
+        start_of_day, end_of_day = self.get_today_date_range()
+        findings = self.inspector_client.list_findings(
+            filterCriteria={
+                'resourceId': [{'comparison': 'EQUALS', 'value': self.instance_id}],
+                'createdAt': [{'startInclusive': start_of_day, 'endExclusive': end_of_day}]
+            }
+        )['findings']
+        
+        assert len(findings) < 10, "EC2 instance has more than 10 Inspector findings"
+
+    def test_inspector_finding_severity_distribution(self):
+        start_of_day, end_of_day = self.get_today_date_range()
+        findings = self.inspector_client.list_findings(
+            filterCriteria={
+                'resourceId': [{'comparison': 'EQUALS', 'value': self.instance_id}],
+                'createdAt': [{'startInclusive': start_of_day, 'endExclusive': end_of_day}]
+            }
+        )['findings']
+        
+        severity_count = {'LOW': 0, 'MEDIUM': 0, 'HIGH': 0, 'CRITICAL': 0}
+        for finding in findings:
+            severity_count[finding['severity']] += 1
+        
+        assert severity_count['HIGH'] < 5, "More than 5 high severity findings found"
+        assert severity_count['CRITICAL'] == 0, "Critical severity findings found"
 
 def lambda_handler(event, context):
     instance_id = event['detail']['requestParameters']['instanceId']

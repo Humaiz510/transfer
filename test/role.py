@@ -4,20 +4,23 @@ import json
 # Initialize the IAM client
 iam_client = boto3.client('iam')
 
-# Define role and policy names (example names)
+# Define role name (example name)
 role_name = 'MyExampleRole'
-inline_policy_name = 'MyExampleInlinePolicy'
-managed_policy_name = 'AmazonS3ReadOnlyAccess'
 
-# Fetch assume role policy document
-assume_role_policy = iam_client.get_role(RoleName=role_name)['Role']['AssumeRolePolicyDocument']
+# Fetch role details
+role = iam_client.get_role(RoleName=role_name)['Role']
+assume_role_policy = role['AssumeRolePolicyDocument']
 
-# Fetch inline policy document
-inline_policy = iam_client.get_role_policy(RoleName=role_name, PolicyName=inline_policy_name)['PolicyDocument']
+# Fetch inline policies
+inline_policies = iam_client.list_role_policies(RoleName=role_name)['PolicyNames']
+inline_policies_docs = {}
+for policy_name in inline_policies:
+    policy_doc = iam_client.get_role_policy(RoleName=role_name, PolicyName=policy_name)['PolicyDocument']
+    inline_policies_docs[policy_name] = policy_doc
 
-# Fetch managed policy ARN
-managed_policy_arn = iam_client.list_attached_role_policies(RoleName=role_name)['AttachedPolicies']
-managed_policy_arn = [policy['PolicyArn'] for policy in managed_policy_arn if policy['PolicyName'] == managed_policy_name][0]
+# Fetch managed policies
+managed_policies = iam_client.list_attached_role_policies(RoleName=role_name)['AttachedPolicies']
+managed_policy_arns = [policy['PolicyArn'] for policy in managed_policies]
 
 # Create CloudFormation template with parameters
 cloudformation_template = {
@@ -26,14 +29,6 @@ cloudformation_template = {
         "RoleName": {
             "Type": "String",
             "Default": role_name
-        },
-        "InlinePolicyName": {
-            "Type": "String",
-            "Default": inline_policy_name
-        },
-        "ManagedPolicyArn": {
-            "Type": "String",
-            "Default": managed_policy_arn
         }
     },
     "Resources": {
@@ -41,26 +36,23 @@ cloudformation_template = {
             "Type": "AWS::IAM::Role",
             "Properties": {
                 "AssumeRolePolicyDocument": assume_role_policy,
-                "Policies": [
-                    {
-                        "PolicyName": {
-                            "Ref": "InlinePolicyName"
-                        },
-                        "PolicyDocument": inline_policy
-                    }
-                ],
-                "ManagedPolicyArns": [
-                    {
-                        "Ref": "ManagedPolicyArn"
-                    }
-                ],
                 "RoleName": {
                     "Ref": "RoleName"
-                }
+                },
+                "ManagedPolicyArns": managed_policy_arns,
+                "Policies": []
             }
         }
     }
 }
+
+# Add inline policies to the template
+for policy_name, policy_doc in inline_policies_docs.items():
+    policy = {
+        "PolicyName": policy_name,
+        "PolicyDocument": policy_doc
+    }
+    cloudformation_template["Resources"]["MyIAMRole"]["Properties"]["Policies"].append(policy)
 
 # Save CloudFormation template to a JSON file
 with open('cloudformation_template.json', 'w') as f:

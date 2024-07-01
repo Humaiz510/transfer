@@ -1,0 +1,522 @@
+import boto3
+import json
+import logging
+from botocore.exceptions import NoCredentialsError, ClientError
+import os
+import requests
+from urllib3.exceptions import InsecureRequestWarning
+from urllib3 import disable_warnings
+import traceback
+import re
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+
+# Initialize logger
+def init_logger():
+    logger = logging.getLogger('aws_standardization')
+    logger.setLevel(logging.INFO)
+    handler = logging.FileHandler('standardization.log')
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+logger = init_logger()
+
+def load_config():
+    load_dotenv()
+    config = {
+        'cross_account_role_arn': os.environ['cross_account_role_arn'],
+        's3_bucket_name': "patchmanagementpoc",
+        'region': 'us-east-1',
+        'main_access_key': os.environ['innovation_id'],
+        'main_secret_key': os.environ['innovation_secret'],
+        'source_account_id': os.environ['source_account_id'],
+        'destination_account_id': os.environ['destination_account_id']
+    }
+    return config
+
+def session(access_key, secret_key, region_name, token=None):
+    if token:
+        return boto3.Session(
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region_name,
+            aws_session_token=token
+        )
+    else:
+        return boto3.Session(
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region_name
+        )
+
+def clients(resource, session):
+    return session.client(resource, verify=False)
+
+def assume_role_session_creds(sts_client, role_arn, session_name):
+    try:
+        creds = sts_client.assume_role(RoleArn=role_arn, RoleSessionName=session_name)['Credentials']
+        return creds['AccessKeyId'], creds['SecretAccessKey'], creds['SessionToken']
+    except ClientError as e:
+        logger.error(f"Failed to assume role: {e}")
+        raise
+
+def check_application_exists(app_registry_client, app_name):
+    try:
+        response = app_registry_client.list_applications()
+        for app in response['applications']:
+            if app['name'] == app_name:
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"Error checking application existence: {e}")
+        return False
+
+def get_application_resources(app_registry_client, tagging_client, app_name):
+    try:
+        response = app_registry_client.list_applications()
+        for app in response['applications']:
+            if app['name'] == app_name:
+                app_id = app['id']
+                app_tag = app_registry_client.get_application(application=app_name)['applicationTag']
+                resources = tagging_client.get_resources(TagFilters=[{'Key': list(app_tag.keys())[0], 'Values': [list(app_tag.values())[0]]}])
+                return resources['ResourceTagMappingList']
+        return []
+    except Exception as e:
+        logger.error(f"Error getting application resources: {e}")
+        return []
+
+def tag_resources(tagging_client, resource_arn_list, tags_dict):
+    try:
+        response = tagging_client.tag_resources(ResourceARNList=resource_arn_list, Tags=tags_dict)
+        logger.info("Existing resources were tagged with application tag")
+        failed_resources = []
+        if 'FailedResourcesMap' in response.keys():
+            for resource in response['FailedResourcesMap']:
+                failed_resources.append(resource)
+        return failed_resources
+    except Exception as e:
+        logger.error(f"Error tagging resources: {e}")
+        return []
+
+def create_application(app_registry_client, app_name):
+    try:
+        response = app_registry_client.create_application(
+            name=app_name,
+            description='Created by automation script'
+        )
+        return response['application']['id']
+    except Exception as e:
+        logger.error(f"Error creating application: {e}")
+        return None
+
+def get_application_tag(app_registry_client, app_name):
+    try:
+        response = app_registry_client.list_applications()
+        for app in response['applications']:
+            if app['name'] == app_name:
+                app_tag = app_registry_client.get_application(application=app_name)['applicationTag']
+                return [list(app_tag.keys())[0], list(app_tag.values())[0]]
+        return []
+    except Exception as e:
+        logger.error(f"Error getting application tag: {e}")
+        return []
+
+def create_cloudformation_template(resource_arns, lambda_client, destination_lambda_client, iam_client, s3_client, ec2_client, kms_client, destination_iam_client, destination_s3_client, source_account_id, destination_account_id, application_tag, lambda_code_storage_bucket):
+    resources = {}
+    iam_resources = {}
+    lambda_count = 0
+    log_count = 0
+    kms_count = 0
+    roles_created = []
+    policies_created = []
+
+    for arn in resource_arns:
+        resource_arn = arn if isinstance(arn, str) else arn['ResourceARN']
+        resource_type, resource_id = resource_arn.split(':')[2], resource_arn.split('/')[-1]
+
+        if resource_type == 'ec2':
+            ec2_details = get_ec2_instance_details(ec2_client, resource_id)
+            resources[f'EC2Instance{lambda_count}'] = {'Type': 'AWS::EC2::Instance', 'Properties': ec2_details}
+            lambda_count += 1
+
+        elif resource_type == 's3':
+            bucket_name = resource_arn.split(':::')[-1]
+            s3_details = get_s3_bucket_details(s3_client, bucket_name)
+            s3_bucket_name = s3_details['BucketName'] + '-' + destination_account_id
+            resources[f'S3Bucket{log_count}'] = {
+                'Type': 'AWS::S3::Bucket',
+                'Properties': {
+                    'BucketName': s3_bucket_name,
+                    'BucketEncryption': {
+                        'ServerSideEncryptionConfiguration': [
+                            {'ServerSideEncryptionByDefault': {'SSEAlgorithm': 'AES256'}}
+                        ]
+                    },
+                    'Tags': [{'Key': application_tag[0], 'Value': application_tag[1]}]
+                }
+            }
+            log_count += 1
+
+        elif resource_type == 'lambda':
+            lambda_details = get_lambda_function_details(lambda_client, lambda_code_storage_bucket, destination_s3_client, resource_id)
+            if not lambda_exists(destination_lambda_client, resource_id.split(':')[-1]):
+                role_name = lambda_details['Role'].split('/')[-1]
+                updated_role_arn = lambda_details['Role'].replace(source_account_id, str(destination_account_id))
+                lambda_details['Role'] = updated_role_arn
+
+                if role_name not in roles_created:
+                    role_properties = create_role_template(iam_client, destination_iam_client, role_name, destination_account_id)
+                    iam_resources[f'IAMRole{len(roles_created)}'] = {
+                        'Type': 'AWS::IAM::Role',
+                        'Properties': role_properties
+                    }
+                    roles_created.append(role_name)
+
+                    for policy_arn in role_properties['ManagedPolicyArns']:
+                        if policy_arn not in policies_created:
+                            policy_name = policy_arn.split('/')[-1]
+                            if not check_policy_exists(destination_iam_client, policy_name):
+                                policy_properties = create_managed_policy_template(iam_client, role_name, policy_arn, destination_account_id)
+                                iam_resources[f'IAMManagedPolicy{len(policies_created)}'] = {
+                                    'Type': 'AWS::IAM::ManagedPolicy',
+                                    'Properties': policy_properties
+                                }
+                                policies_created.append(policy_arn)
+
+                resources[f'LambdaFunction{lambda_count}'] = {'Type': 'AWS::Lambda::Function', 'Properties': lambda_details}
+                resources[f'LogsLogGroup{log_count}'] = {
+                    'Type': 'AWS::Logs::LogGroup',
+                    'Properties': {'LogGroupName': f"/aws/lambda/{lambda_details['FunctionName']}"}
+                }
+                lambda_count += 1
+                log_count += 1
+
+        elif resource_type == 'kms':
+            kms_id = resource_arn.split('/')[-1]
+            properties = get_kms_details(kms_client, kms_id)
+            key_policy = json.loads(properties['KeyPolicy'])
+            key_policy = json_replacer(key_policy, source_account_id, destination_account_id)
+            resources[f'KMSKey{kms_count}'] = {
+                'Type': 'AWS::KMS::Key',
+                'Properties': {
+                    'Enabled': properties['Enabled'],
+                    'Description': properties['Description'],
+                    'KeyPolicy': key_policy,
+                    'KeySpec': properties['KeySpec'],
+                    'Tags': [{'Key': application_tag[0], 'Value': application_tag[1]}]
+                }
+            }
+            kms_count += 1
+
+    cloudformation_template = {'AWSTemplateFormatVersion': '2010-09-09', 'Resources': resources}
+    iam_cloudformation_template = {'AWSTemplateFormatVersion': '2010-09-09', 'Resources': iam_resources}
+
+    return json.dumps(cloudformation_template, indent=2), json.dumps(iam_cloudformation_template, indent=2)
+
+def get_lambda_function_details(lambda_client, s3_bucket, destination_s3_client, id):
+    response = lambda_client.get_function(FunctionName=id)
+    configuration = response['Configuration']
+    code = response['Code']
+
+    try:
+        s3_bucket, s3_key = upload_lambda_code_to_s3(code['Location'], destination_s3_client, s3_bucket)
+    except Exception as e:
+        logger.error(f"Put Object access denied or Invalid s3 bucket name: {e}")
+        return
+
+    layers = [layer['Arn'] for layer in configuration['Layers']] if 'Layers' in configuration else []
+    environment = configuration['Environment'] if 'Environment' in configuration else {}
+    tags = [{'Key': k, 'Value': v} for k, v in response.get('Tags', {}).items() if not k.startswith('aws:')]
+
+    return {
+        'FunctionName': configuration['FunctionName'],
+        'Handler': configuration['Handler'],
+        'Code': {'S3Bucket': s3_bucket, 'S3Key': s3_key},
+        'MemorySize': configuration['MemorySize'],
+        'Role': configuration['Role'],
+        'Runtime': configuration['Runtime'],
+        'Timeout': configuration['Timeout'],
+        'TracingConfig': {'Mode': configuration['TracingConfig']['Mode']},
+        'EphemeralStorage': {'Size': configuration['EphemeralStorage']['Size']},
+        'Tags': tags,
+        'Environment': environment,
+        'Layers': layers
+    }
+
+def lambda_exists(lambda_client, lambda_name):
+    try:
+        lambda_client.get_function(FunctionName=lambda_name)
+        return True
+    except ClientError:
+        return False
+
+def upload_lambda_code_to_s3(lambda_code_url, s3_client, s3_bucket):
+    code_url = lambda_code_url.split('https://')[1].split('?versionId=')[0]
+    s3_file_name = code_url.split('.s3.amazonaws.com/')[-1].split('/')[-1]
+    file_url = lambda_code_url
+    s3_key = s3_file_name + '.zip'
+
+    try:
+        response = requests.get(file_url, stream=True)
+        response.raise_for_status()
+        s3_client.upload_fileobj(response.raw, s3_bucket, s3_key)
+        return s3_bucket, s3_key
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error downloading file from URL: {e}")
+    except NoCredentialsError:
+        logger.error("Credentials not available")
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+
+def write_template_to_s3_bucket(s3_client, bucket, body, key):
+    try:
+        response = s3_client.put_object(Bucket=bucket, Body=body, Key=key + '.json')
+        return response
+    except ClientError as e:
+        logger.error(f"Error writing template to S3 bucket: {e}")
+
+def deploy_stack(cloudformation_client, stack_name, template_body):
+    try:
+        cloudformation_client.validate_template(TemplateBody=template_body)
+        response = cloudformation_client.create_stack(
+            StackName=stack_name,
+            TemplateBody=template_body,
+            Capabilities=['CAPABILITY_NAMED_IAM']
+        )
+        logger.info(f"Stack {stack_name} deployed successfully.")
+        return response['StackId']
+    except cloudformation_client.exceptions.AlreadyExistsException:
+        logger.warning(f"Stack {stack_name} already exists.")
+    except ClientError as e:
+        logger.error(f"Error occurred while creating stack: {e}")
+    return None
+
+def upload_template_to_bucket(s3_client, s3_bucket, template=None, app_name=None, stack_name=None):
+    logger.info("Uploading template to s3")
+    if template != 'null':
+        response = write_template_to_s3_bucket(s3_client, s3_bucket, template, app_name + '/' + stack_name)
+        return response
+
+def create_and_deploy_stack(app_name, resources, cloudformation_client, lambda_client_main, lambda_client_destination_account, iam_client_main, s3_client_main, ec2_client_main, kms_client_main, iam_client_account_1, s3_client_account_1, source_account_id, destination_account_id, application_tag, stack_name, stack_name_2, account_name, account_client, app_id, deploy, lambda_code_storage_bucket):
+    template_1, template_2 = create_cloudformation_template(resources, lambda_client_main, lambda_client_destination_account, iam_client_main, s3_client_main, ec2_client_main, kms_client_main, iam_client_account_1, s3_client_account_1, source_account_id, destination_account_id, application_tag, lambda_code_storage_bucket)
+    if app_id:
+        if deploy:
+            logger.info('Deploying')
+            if template_2 != 'null':
+                deploy_stack(cloudformation_client, stack_name, template_2)
+                time.sleep(15)
+            deploy_stack(cloudformation_client, stack_name_2, template_1)
+        else:
+            upload_template_to_bucket(s3_client_account_1, lambda_code_storage_bucket, template_2, app_name, stack_name)
+            upload_template_to_bucket(s3_client_account_1, lambda_code_storage_bucket, template_1, app_name, stack_name_2)
+    else:
+        logger.error(f"Failed to create application {app_name} in {account_name}.")
+
+def compare_and_create_resources(resource_arns_account_1, resource_arns_account_2, cf_client_account_1, lambda_client_main, iam_client_main, s3_client_main, ec2_client_main, kms_client_main, iam_client_account_1, s3_client_account_1, cf_client_account_2, lambda_client_account_1, resource_group_stagging_client_account_1, source_account_id, destination_account_id, stack_name_roles, stack_name_resources, application_tag, lambda_code_storage_bucket, deploy, app_name):
+    account_1_resource_names = {arn['ResourceARN'].split(':')[-1] for arn in resource_arns_account_1}
+    account_2_resource_names = {arn['ResourceARN'].split(':')[-1] for arn in resource_arns_account_2}
+
+    missing_resource_names = account_1_resource_names - account_2_resource_names
+    missing_resources_names_account_1 = account_2_resource_names - account_1_resource_names
+
+    missing_resource_arns = [arn['ResourceARN'] for arn in resource_arns_account_1 if arn['ResourceARN'].split(':')[-1] in missing_resource_names]
+    updated_missing_resource_arns = [resource.replace(source_account_id, destination_account_id) for resource in missing_resource_arns]
+
+    resources_to_tag = verify_resources_exist(lambda_client_account_1, s3_client_account_1, kms_client_main, updated_missing_resource_arns)
+    resources_to_create = [arn.replace(destination_account_id, source_account_id) for arn in updated_missing_resource_arns if arn not in resources_to_tag]
+
+    resources_to_delete = [arn['ResourceARN'] for arn in resource_arns_account_2 if arn['ResourceARN'].split(':')[-1] in missing_resources_names_account_1]
+    for arn in resources_to_delete:
+        delete_resources(resource_group_stagging_client_account_1, arn, application_tag)
+
+    if not resources_to_create:
+        logger.info('Application is standardized across both accounts.')
+        return
+
+    cf_template_1, cf_template_2 = create_cloudformation_template(resources_to_create, lambda_client_main, lambda_client_account_1, iam_client_main, s3_client_main, ec2_client_main, kms_client_main, iam_client_account_1, s3_client_account_1, source_account_id, destination_account_id, application_tag, lambda_code_storage_bucket)
+
+    logger.info('Creating resources')
+
+    if deploy:
+        if cf_template_2 != 'null':
+            new_template = json.dumps(cf_template_2).replace(source_account_id, destination_account_id)
+            deploy_stack(cf_client_account_2, stack_name_roles, json.loads(new_template))
+            time.sleep(10)
+
+        if cf_template_1:
+            deploy_stack(cf_client_account_2, stack_name_resources, cf_template_1)
+    else:
+        if cf_template_2 != 'null':
+            new_template = json.dumps(cf_template_2).replace(source_account_id, destination_account_id)
+            upload_template_to_bucket(s3_client_account_1, lambda_code_storage_bucket, json.loads(new_template), app_name, stack_name_roles)
+
+        if cf_template_1:
+            upload_template_to_bucket(s3_client_account_1, lambda_code_storage_bucket, cf_template_1, app_name, stack_name_resources)
+
+def verify_resources_exist(lambda_client, s3_client, kms_client, resource_arns):
+    existing_resources = []
+    for arn in resource_arns:
+        try:
+            resource_type = arn.split(':')[2]
+            resource_id = arn.split('/')[-1]
+            if resource_type == 'lambda':
+                lambda_client.get_function(FunctionName=resource_id)
+            elif resource_type == 's3':
+                s3_client.get_bucket_policy(Bucket=resource_id)
+            existing_resources.append(arn)
+        except Exception as e:
+            continue
+    return existing_resources
+
+def add_tag_to_resource(tagging_api_client, resource_arn, application_tag):
+    logger.info(f"Resource '{resource_arn}' was found and tagged in destination account")
+    response = tagging_api_client.tag_resources(ResourceARNList=[resource_arn], Tags={application_tag[0]: application_tag[1]})
+    return response
+
+def delete_resources(tagging_api_client, resource_arn, application_tag):
+    logger.info(f"Resource '{resource_arn}' was removed from application resource list")
+    response = tagging_api_client.untag_resources(ResourceARNList=[resource_arn], TagKeys=[application_tag[0]])
+    return response
+
+def get_ec2_instance_details(client, id):
+    response = client.describe_instances(InstanceIds=[id])
+    instance = response['Reservations'][0]['Instances'][0]
+    return {
+        'InstanceId': instance['InstanceId'],
+        'InstanceType': instance['InstanceType'],
+        'KeyName': instance['KeyName'],
+        'SubnetId': instance['SubnetId'],
+        'SecurityGroupIds': [sg['GroupId'] for sg in instance['SecurityGroups']],
+        'IamInstanceProfile': instance.get('IamInstanceProfile', {}).get('Arn')
+    }
+
+def get_s3_bucket_details(client, bucket):
+    response = client.get_bucket_location(Bucket=bucket)
+    location = response['LocationConstraint']
+    return {
+        'BucketName': bucket,
+        'LocationConstraint': location
+    }
+
+def create_managed_policy_template(iam_client, role_name, policy_arn, destination_account_id):
+    policy_version = iam_client.get_policy(PolicyArn=policy_arn)['Policy']['DefaultVersionId']
+    policy = iam_client.get_policy_version(PolicyArn=policy_arn, VersionId=policy_version)
+    managed_policy_name = policy_arn.split('/')[-1]
+    path = policy_arn.split('policy/')[-1]
+    new_path = ''
+    if path == managed_policy_name:
+        new_path = '/'
+    else:
+        new_path = '/' + path.replace(managed_policy_name, '')
+    document = policy['PolicyVersion']['Document']
+    return {
+        "ManagedPolicyName": managed_policy_name,
+        "Path": new_path,
+        "PolicyDocument": document
+    }
+
+def create_role_template(iam_client, destination_iam_client, role_name, destination_account_id):
+    role = iam_client.get_role(RoleName=role_name)['Role']
+    assume_role_policy = role['AssumeRolePolicyDocument']
+    path = role['Path']
+    inline_policies = iam_client.list_role_policies(RoleName=role_name)['PolicyNames']
+    inline_policies_docs = {}
+    for policy_name in inline_policies:
+        policy_doc = iam_client.get_role_policy(RoleName=role_name, PolicyName=policy_name)['PolicyDocument']
+        inline_policies_docs[policy_name] = policy_doc
+
+    managed_policies = iam_client.list_attached_role_policies(RoleName=role_name)['AttachedPolicies']
+    managed_policy_arns = [policy['PolicyArn'] for policy in managed_policies]
+
+    cloudformation_template = {
+        "Path": path,
+        "AssumeRolePolicyDocument": assume_role_policy,
+        "RoleName": role_name,
+        "ManagedPolicyArns": managed_policy_arns,
+        "Policies": []
+    }
+
+    for policy_name, policy_doc in inline_policies_docs.items():
+        if not check_policy_exists(destination_iam_client, policy_name):
+            policy = {
+                "PolicyName": policy_name,
+                "PolicyDocument": policy_doc
+            }
+            cloudformation_template["Policies"].append(policy)
+        else:
+            policy = {
+                "PolicyName": policy_name
+            }
+            cloudformation_template["Policies"].append(policy)
+
+    return cloudformation_template
+
+def get_kms_details(client, id):
+    key_details = client.describe_key(KeyId=id)
+    key_policy = client.get_key_policy(KeyId=key_details['KeyMetadata']['KeyId'])
+    properties = {
+        'Enabled': key_details['KeyMetadata']['Enabled'],
+        'Description': key_details['KeyMetadata']['Description'],
+        'KeyPolicy': key_policy['Policy'],
+        'KeySpec': key_details['KeyMetadata']['KeySpec'],
+    }
+    return properties
+
+def json_replacer(dict_, old, new):
+    new_json = json.dumps(dict_)
+    new_json = new_json.replace(old, new)
+    new_json = json.loads(new_json)
+    return new_json
+
+def create_or_update_application(config, app_name, deploy=False):
+    session_main = session(config['main_access_key'], config['main_secret_key'], config['region'])
+    sts_client_main = clients('sts', session_main)
+    app_registry_client_main = clients('servicecatalog-appregistry', session_main)
+    resource_group_stagging_client_main = clients('resourcegroupstaggingapi', session_main)
+
+    cross_account_role_arn = config['cross_account_role_arn']
+    account_1_access_key, account_1_secret_key, account_1_token = assume_role_session_creds(
+        sts_client_main, cross_account_role_arn, 'TestSessionName'
+    )
+    session_account_1 = session(account_1_access_key, account_1_secret_key, config['region'], account_1_token)
+    app_registry_client_account_1 = clients('servicecatalog-appregistry', session_account_1)
+    resource_group_stagging_client_account_1 = clients('resourcegroupstaggingapi', session_account_1)
+    cloudformation_client_account_1 = clients('cloudformation', session_account_1)
+    lambda_client_main = clients('lambda', session_main)
+    lambda_client_account_1 = clients('lambda', session_account_1)
+    iam_client_main = clients('iam', session_main)
+    iam_client_account_1 = clients('iam', session_account_1)
+    s3_client_main = clients('s3', session_main)
+    s3_client_account_1 = clients('s3', session_account_1)
+    ec2_client_main = clients('ec2', session_main)
+    kms_client_main = clients('kms', session_main)
+
+    if not check_application_exists(app_registry_client_main, app_name):
+        logger.info(f"Application {app_name} does not exist in the source account.")
+        return
+
+    resources = get_application_resources(app_registry_client_main, resource_group_stagging_client_main, app_name)
+
+    if not check_application_exists(app_registry_client_account_1, app_name):
+        logger.info(f"Creating application {app_name} in the destination account.")
+        app_id = create_application(app_registry_client_account_1, app_name)
+        application_tag = get_application_tag(app_registry_client_account_1, app_name)
+        resources_to_tag = [resource_arn['ResourceARN'].replace(config['source_account_id'], config['destination_account_id']) for resource_arn in resources]
+        failed_resources = tag_resources(resource_group_stagging_client_account_1, resources_to_tag, {application_tag[0]: application_tag[1]})
+        create_and_deploy_stack(app_name, resources_to_tag, cloudformation_client_account_1, lambda_client_main, lambda_client_account_1, iam_client_main, s3_client_main, ec2_client_main, kms_client_main, iam_client_account_1, s3_client_account_1, config['source_account_id'], config['destination_account_id'], application_tag, f"{app_name}--iam-stack", f"{app_name}--stack", 'destination', app_registry_client_account_1, app_id, deploy, config['s3_bucket_name'])
+    else:
+        application_tag = get_application_tag(app_registry_client_account_1, app_name)
+        resources_application_2 = get_application_resources(app_registry_client_account_1, resource_group_stagging_client_account_1, app_name)
+        compare_and_create_resources(resources, resources_application_2, cloudformation_client_account_1, lambda_client_main, iam_client_main, s3_client_main, ec2_client_main, kms_client_main, iam_client_account_1, s3_client_account_1, cloudformation_client_account_1, lambda_client_account_1, resource_group_stagging_client_account_1, config['source_account_id'], config['destination_account_id'], f"{app_name}--iam-stack", f"{app_name}--stack", application_tag, config['s3_bucket_name'], deploy, app_name)
+
+def main():
+    config = load_config()
+    disable_warnings(InsecureRequestWarning)
+    create_or_update_application(config, "NewApplication")
+
+if __name__ == "__main__":
+    main()

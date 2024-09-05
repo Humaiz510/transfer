@@ -1,0 +1,103 @@
+If your Salesforce org does not have any data (i.e., no Accounts or Contacts), you’ll need to create the required data first before testing the "Approved Funds on Account/Contact" workflow. Below is a step-by-step guide that covers everything you need to do, including creating data in Salesforce, setting up the test environment, and then building your test case in **Testim TTA**.
+
+### Step 1: **Create Test Data (Accounts and Contacts) in Salesforce**
+
+Since you have no Accounts or Contacts in your Salesforce org, you'll need to create them manually or programmatically. Here’s how to create them manually:
+
+#### **Create a New Account**
+1. **Log into Salesforce**: Use your Salesforce login credentials.
+2. **Navigate to the "Accounts" Tab**:
+   - Click on the App Launcher (9 dots in the top left).
+   - Search for "Accounts" and click on it.
+3. **Create a New Account**:
+   - Click the **"New"** button on the Accounts page.
+   - Fill in the required fields (e.g., **Account Name**, **Phone**, **Industry**).
+   - Click **"Save"**.
+
+#### **Create a New Contact**
+1. **Navigate to the "Contacts" Tab**:
+   - Again, go to the App Launcher and search for **"Contacts"**.
+2. **Create a New Contact**:
+   - Click **"New"** on the Contacts page.
+   - Fill in the details like **First Name**, **Last Name**, and **Email**.
+   - Associate this Contact with the Account you created by selecting it in the **"Account Name"** lookup field.
+   - Click **"Save"**.
+
+### Step 2: **Create Agreements in Salesforce (if necessary)**
+
+If your Salesforce org includes a custom **"Agreements"** object, you need to ensure it's configured and ready for use. If there’s no custom object named **Agreements**, either:
+- You need to work with your Salesforce administrator to create this custom object.
+- If you're using a standard object, identify which Salesforce object represents agreements or contractual arrangements (e.g., **Opportunities**, **Orders**, or **Contracts**).
+
+#### **Create a New Agreement (or Contract/Opportunity)**
+1. **Go to the Relevant Object Tab**:
+   - Navigate to the relevant tab (e.g., **Agreements**, **Opportunities**, or **Contracts**).
+   - If you're working with a custom Agreements object, you might need to search for it in the App Launcher.
+2. **Create a New Agreement**:
+   - Click **"New"**.
+   - Fill in the fields (e.g., **Agreement Name**, **Amount**, **Date**).
+   - Associate this Agreement with the previously created Account.
+   - Click **"Save"**.
+
+### Step 3: **Ensure Approved Funds Field Exists**
+
+Make sure the **"Approved Funds"** field exists on the Account or Contact object. If it does not exist, you need to create a custom field.
+
+#### **Create a Custom Field for "Approved Funds" (if necessary)**
+1. **Navigate to Setup**:
+   - Click on the gear icon in the top right and go to **"Setup"**.
+2. **Go to Object Manager**:
+   - In Setup, find the **"Object Manager"** tab and search for **"Account"** or **"Contact"** (depending on where you need the field).
+3. **Create a New Custom Field**:
+   - Click **"Fields & Relationships"**.
+   - Click the **"New"** button to add a new custom field.
+   - Choose **Currency** or **Number** for the field type and name it **"Approved Funds"**.
+   - Set the necessary visibility and permissions for different profiles.
+   - Click **"Save"**.
+
+### Step 4: **Verify Profiles and Permissions**
+
+Ensure that the user profile you're testing has the correct permissions to view and edit the **Approved Funds** field and the associated objects (Accounts, Contacts, Agreements).
+
+1. **Go to Setup**:
+   - Click on the gear icon and go to **"Setup"**.
+2. **Search for "Profiles"**:
+   - In Setup, search for **"Profiles"** and click on the relevant profile assigned to your test user.
+3. **Check Object Permissions**:
+   - Scroll to the **"Object Settings"** section and ensure that the **Account**, **Contact**, and **Agreement** (or related object) have the necessary permissions.
+   - Make sure the **Approved Funds** field is visible and editable.
+
+### Step 5: **Test Setup in Testim TTA**
+
+Once you’ve created the data and verified the correct fields and profiles, you can now create the test case in **Testim TTA** as follows:
+
+#### **Login to Salesforce**
+1. Record the login steps as outlined in my previous message.
+
+#### **Navigate to the Account/Contact Tab**
+1. Use the App Launcher to navigate to the **Accounts** or **Contacts** tab.
+2. Click on the Account or Contact you just created.
+
+#### **Capture the Initial Approved Funds Value**
+1. Scroll to the **Approved Funds** field and capture its value using Testim’s validation/assertion feature.
+
+#### **Create a New Agreement**
+1. Navigate to the **Agreements** related list for the Account.
+2. Click **"New"** and fill in the Agreement details.
+3. Save the new Agreement.
+
+#### **Navigate Back and Validate Approved Funds**
+1. Go back to the Account/Contact.
+2. Verify that the **Approved Funds** field is updated with the new value.
+
+#### **Final Test Case**
+1. Ensure you have assertions set up to verify both the initial and final values of **Approved Funds**.
+2. Optionally, add steps to clean up the created data.
+
+### Additional Notes:
+- **Field Mapping**: Ensure the **Approved Funds** field is properly mapped to agreements/contracts so that the field updates correctly when agreements are created.
+- **Data Cleanup**: In a test environment, you may want to create a cleanup step to delete the test data after the test runs.
+  
+This setup will allow you to run your test case in Testim TTA successfully.
+
+Let me know if you need further assistance with any of these steps!
